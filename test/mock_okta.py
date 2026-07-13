@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A tiny fake Okta `/api/v1/users` endpoint for validating import-okta-users.
+"""A tiny fake Okta `/api/v1/users` endpoint for validating import-users okta.
 
 Serves two pages joined by a `Link: ...; rel="next"` header so the extension's
 pagination, JSON parsing, and active/inactive classification can be exercised
@@ -12,7 +12,7 @@ Usage:
 
 Then, in another shell (see README "Validating locally"):
     aspect auth login
-    OKTA_API_TOKEN=dummy aspect import-okta-users --okta-org=http://localhost:8799
+    OKTA_API_TOKEN=dummy aspect import-users okta --okta-org=http://localhost:8799 --dry-run
 """
 import json
 import os

@@ -20,3 +20,7 @@ echo "${output}" | grep -q "missing OKTA_API_TOKEN" || {
     exit 1
 }
 ~~~
+
+CI only asserts the guard (it has no credentials or network). To see the real
+reconciliation output against a bundled fake Okta, see **Validating locally** in
+the [top-level README](../README.md).

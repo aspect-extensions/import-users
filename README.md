@@ -185,6 +185,45 @@ __ASPECT_ENVIRONMENT__=staging OKTA_API_TOKEN=dummy \
   aspect import-users okta --okta-org=http://localhost:8799 --profile staging --dry-run
 ```
 
+## Adding an identity provider
+
+Layout:
+
+| File           | Role                                                              |
+| -------------- | ---------------------------------------------------------------- |
+| `frontegg.axl` | Shared, provider-agnostic core: aspect-auth identity, the Frontegg client (invite / find / deactivate), and the reconcile + dry-run/apply loop. Exposes `reconcile()` and `fail()`. |
+| `okta.axl`     | Okta reader: fetch + paginate + normalize, then call `reconcile()`. |
+| `MODULE.aspect`| Re-exports each reader task (`use_task(...)`).                    |
+
+To add a provider (e.g. Entra), write `entra.axl`:
+
+```starlark
+load("./frontegg.axl", "fail", "reconcile")
+
+def impl(ctx):
+    # 1. Read + paginate users from your IdP.
+    # 2. Normalize each to a struct with these fields:
+    #      login, email, first_name, last_name, status, active (bool)
+    # 3. Hand off — the shared core does identity, diff, and the writes.
+    return reconcile(ctx, users)
+
+entra = task(
+    group = ["import-users"],           # -> `aspect import-users entra`
+    implementation = impl,
+    args = {
+        # provider-specific args here, plus the shared set:
+        "role": args.string(default = "viewer"),
+        "dry_run": args.boolean(default = False),
+        "frontegg_url": args.string(default = ""),
+        "send_invite_email": args.boolean(default = False),
+        "profile": args.string(default = ""),
+    },
+)
+```
+
+Then add `use_task("entra.axl", "entra")` to `MODULE.aspect`. Keep provider
+specifics (auth, endpoints, field mapping) in the reader; the core stays generic.
+
 ## Status
 
 Read + pagination + dry-run diff, `aspect auth`-derived account scoping, and the
