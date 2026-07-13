@@ -26,9 +26,17 @@ still being confirmed. Until then `dry_run` defaults to True and the apply path
 only prints the planned changes.
 """
 
-# Roles the proxy is allowed to assign. Hard-limited blast radius (ENG-1746):
-# never vendor/super-admin, only these account-scoped roles.
-_ALLOWED_ROLES = ["Account Admin", "Account Viewer"]
+# Roles the proxy is allowed to assign, mapped from the display name the
+# operator types to the Frontegg role key the proxy uses. Hard-limited blast
+# radius (ENG-1746): never vendor/super-admin, only these account-scoped roles.
+# NOTE: "account.admin" is confirmed from a real token's `roles` claim;
+# "account.viewer" is inferred by symmetry — confirm against the Frontegg role
+# config before enabling the write path.
+_ROLE_KEYS = {
+    "Account Admin": "account.admin",
+    "Account Viewer": "account.viewer",
+}
+_ALLOWED_ROLES = list(_ROLE_KEYS)
 
 def _fail(ctx: TaskContext, msg: str) -> int:
     ctx.std.io.stderr.write("error: %s\n" % msg)
@@ -167,19 +175,27 @@ def impl(ctx: TaskContext) -> int:
     # WRITE PATH — DISABLED pending ENG-1746 security +1 and a confirmed
     # userinfo-proxy contract. Do NOT enable without both. Intended shape:
     #
+    #   role_key = _ROLE_KEYS[ctx.args.role]   # e.g. "account.admin"
     #   proxy = ctx.args.proxy_url or ctx.std.env.var("ASPECT_USERINFO_PROXY_URL")
     #   auth  = {"Authorization": "Bearer " + creds.access_token,
     #            "Content-Type": "application/json"}
-    #   # NOTE: no account/tenant field in the body or URL. The proxy MUST
-    #   # verify the JWT, read tenant_id from it, and act only on that tenant;
-    #   # it MUST reject any client-supplied account and require Account Admin.
+    #   # No account/tenant field in the body or URL — see proxy contract below.
     #   for u in active:
     #       ctx.http().post(url = proxy + "/users", headers = auth,
     #           data = json.encode({"email": u.email, "firstName": u.first_name,
-    #                               "lastName": u.last_name, "role": ctx.args.role})).block()
+    #                               "lastName": u.last_name, "role": role_key})).block()
     #   for u in inactive:
     #       ctx.http().post(url = proxy + "/users/deactivate", headers = auth,
     #           data = json.encode({"email": u.email})).block()
+    #
+    # Required userinfo-proxy contract (verified against a real token's claims):
+    #   1. Verify JWT signature + `iss` == https://auth.aspect.build.
+    #   2. Validate `aud` == the expected Aspect application id.
+    #   3. Derive the tenant from the token's `tenantId` claim ONLY. Ignore any
+    #      client-supplied account; reject if a body/URL names a different one.
+    #   4. Authorize on `roles` containing "account.admin". The account-admin
+    #      token carries no fe.users.* write scope, so the proxy performs the
+    #      Frontegg write with its own server-side vendor credentials.
     # ----------------------------------------------------------------------
     return _fail(
         ctx,

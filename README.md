@@ -37,8 +37,11 @@ from the `tenant_id` claim of the JWT that `aspect auth login` issued, which the
   misconfigured cron cannot import users into the wrong account.
 - You must `aspect auth login` as an **Account Admin** of that account. The
   proxy authorizes the caller before any write.
-- Assignable roles are capped at `Account Admin` / `Account Viewer` — the tool
-  can never grant a vendor/super-admin role.
+- Assignable roles are capped at `Account Admin` / `Account Viewer` (Frontegg
+  keys `account.admin` / `account.viewer`) — the tool can never grant a
+  vendor/super-admin role. The proxy authorizes writes on the caller's
+  `account.admin` role claim and performs the Frontegg change with its own
+  server-side vendor credentials.
 - **No Frontegg token is ever handled by you.** Frontegg vendor credentials
   live server-side in `userinfo-proxy`; the client only presents its Aspect
   identity. (This is why there is no `ASPECT_APP_TOKEN` / Frontegg secret.)
