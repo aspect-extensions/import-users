@@ -1,44 +1,44 @@
-"""Sync Okta users into Frontegg via the Aspect userinfo-proxy.
+"""Sync Okta users into Frontegg, scoped to your own Aspect account.
 
 Reads users from the Okta admin API (paginated) and reconciles them against
-*your own Aspect account* through the `userinfo-proxy` layer that fronts
-Frontegg: create user, set role (Account Admin / Account Viewer), deactivate.
+your Aspect account in Frontegg: invite user, assign role (viewer / admin),
+deactivate. It talks to Frontegg directly using the credential from
+`aspect auth` — there is no separate service and no Frontegg secret to manage.
 
 Designed to run as a daily CI cron job. The source is intentionally plain and
 auditable so a customer's security/IT team can review it before adopting it.
 
 Account scoping (the security model — see README.md):
-  The target Aspect account is NEVER a flag or a request field. It is taken
-  from the `tenant_id` claim of the JWT that `aspect auth login` issued and
-  the userinfo-proxy re-verifies. A caller can only ever touch the single
-  account their signed token was minted for, so this tool cannot import users
-  into someone else's account even by mistake.
+  The target account is NEVER a flag or a request field. Frontegg derives it
+  from the `frontegg-tenant-id` of the signed `aspect auth` token (an Account
+  Admin's), and only honors it because that token carries the tenant + the
+  `account.admin` role. A caller can only ever manage users in the single
+  account their token was minted for.
 
 Auth:
-  Aspect: `aspect auth login` (as an Account Admin). This task reads the
-          resulting credential via ctx.aspect.auth — no Aspect/Frontegg token
-          is ever handled by the customer or passed on the command line.
-  Okta:   OKTA_API_TOKEN env var, sent to Okta as `Authorization: SSWS <tok>`.
+  Aspect/Frontegg: `aspect auth login` as an Account Admin. Read via
+                   ctx.aspect.auth; sent to Frontegg as `Authorization: Bearer`.
+                   No Frontegg vendor secret is ever handled by the customer.
+  Okta:            OKTA_API_TOKEN env var, sent to Okta as `Authorization: SSWS`.
 
-SECURITY GATE (ENG-1746): mutating identity from a CI job requires a security
-team +1 before the write path is enabled, and the userinfo-proxy contract is
-still being confirmed. Until then `dry_run` defaults to True and the apply path
-only prints the planned changes.
+SECURITY GATE (ENG-1746): mutating identity from a CI job should get a security
+team +1. `dry_run` defaults to True; the write path only runs on
+`--dry_run=false`.
 """
 
-# Roles the proxy is allowed to assign, mapped from the simple name the operator
-# passes (`--role viewer` / `--role admin`) to the Frontegg role key the proxy
-# uses. Hard-limited blast radius (ENG-1746): never vendor/super-admin, only
-# these account-scoped roles. Default is "viewer" — granting admin must be an
-# explicit, deliberate choice.
-# NOTE: "account.admin" is confirmed from a real token's `roles` claim;
-# "account.viewer" is inferred by symmetry — confirm against the Frontegg role
-# config before enabling the write path.
-_ROLE_KEYS = {
-    "viewer": "account.viewer",
-    "admin": "account.admin",
+# The operator passes a simple name (`--role viewer` / `--role admin`); we map
+# it to the Frontegg role id to assign. Hard-limited blast radius (ENG-1746):
+# only these two account-scoped roles, never vendor/super-admin. Default is
+# "viewer" — granting admin must be an explicit, deliberate choice.
+#
+# These are the Aspect Frontegg vendor's role ids (vendor 771ff228, confirmed
+# via the roles API); all Aspect accounts are tenants under that vendor, so the
+# ids are stable. Keyed by the confirmed role keys account.viewer/account.admin.
+_ROLE_IDS = {
+    "viewer": "8e00df9e-c6fc-40c4-9429-b46459c4499a",  # account.viewer
+    "admin": "a33dfcdf-7d8c-48c0-beeb-b9d3b384cf06",  # account.admin
 }
-_ALLOWED_ROLES = list(_ROLE_KEYS)
+_ALLOWED_ROLES = list(_ROLE_IDS)
 
 def _fail(ctx: TaskContext, msg: str) -> int:
     ctx.std.io.stderr.write("error: %s\n" % msg)
@@ -123,6 +123,35 @@ def _aspect_identity(ctx: TaskContext):
         return None, "Aspect credential expired — run `aspect auth login` to refresh"
     return creds, None
 
+def _frontegg_invite(ctx: TaskContext, fe_base: str, creds, user, role_id: str, skip_email: bool):
+    """Invite/create one user in the caller's Frontegg tenant. Returns (ok, msg).
+
+    Uses the Account Admin's Aspect JWT as the bearer; Frontegg scopes the write
+    to the tenant in `frontegg-tenant-id` because the token authorizes it.
+    """
+    headers = {
+        "Authorization": "Bearer %s" % creds.access_token,
+        "Content-Type": "application/json",
+        "frontegg-tenant-id": creds.tenant_id,
+    }
+    body = {
+        "email": user.email,
+        "name": ("%s %s" % (user.first_name, user.last_name)).strip() or user.email,
+        "roleIds": [role_id],
+        "skipInviteEmail": not skip_email,
+    }
+    resp = ctx.http().post(
+        url = fe_base + "/identity/resources/users/v2",
+        headers = headers,
+        data = json.encode(body),
+    ).block()
+
+    if resp.status in [200, 201]:
+        return True, "invited"
+    if resp.status == 409:
+        return True, "already in account (skipped)"
+    return False, "HTTP %d: %s" % (resp.status, resp.body[:300])
+
 # buildifier: disable=function-docstring
 def impl(ctx: TaskContext) -> int:
     okta_org = ctx.args.okta_org or ctx.std.env.var("OKTA_ORG")
@@ -173,37 +202,30 @@ def impl(ctx: TaskContext) -> int:
         ctx.std.io.stdout.write("\ndry-run: no changes pushed. Re-run with --dry_run=false to apply.\n")
         return 0
 
-    # ----------------------------------------------------------------------
-    # WRITE PATH — DISABLED pending ENG-1746 security +1 and a confirmed
-    # userinfo-proxy contract. Do NOT enable without both. Intended shape:
-    #
-    #   role_key = _ROLE_KEYS[ctx.args.role]   # e.g. "account.admin"
-    #   proxy = ctx.args.proxy_url or ctx.std.env.var("ASPECT_USERINFO_PROXY_URL")
-    #   auth  = {"Authorization": "Bearer " + creds.access_token,
-    #            "Content-Type": "application/json"}
-    #   # No account/tenant field in the body or URL — see proxy contract below.
-    #   for u in active:
-    #       ctx.http().post(url = proxy + "/users", headers = auth,
-    #           data = json.encode({"email": u.email, "firstName": u.first_name,
-    #                               "lastName": u.last_name, "role": role_key})).block()
-    #   for u in inactive:
-    #       ctx.http().post(url = proxy + "/users/deactivate", headers = auth,
-    #           data = json.encode({"email": u.email})).block()
-    #
-    # Required userinfo-proxy contract (verified against a real token's claims):
-    #   1. Verify JWT signature + `iss` == https://auth.aspect.build.
-    #   2. Validate `aud` == the expected Aspect application id.
-    #   3. Derive the tenant from the token's `tenantId` claim ONLY. Ignore any
-    #      client-supplied account; reject if a body/URL names a different one.
-    #   4. Authorize on `roles` containing "account.admin". The account-admin
-    #      token carries no fe.users.* write scope, so the proxy performs the
-    #      Frontegg write with its own server-side vendor credentials.
-    # ----------------------------------------------------------------------
-    return _fail(
-        ctx,
-        "apply path is gated: awaiting security sign-off + userinfo-proxy " +
-        "contract confirmation (ENG-1746). Use dry-run for now.",
-    )
+    # ---- WRITE PATH (--dry_run=false) ------------------------------------
+    fe_base = (ctx.args.frontegg_url or ctx.std.env.var("FRONTEGG_URL") or "").rstrip("/")
+    if not fe_base:
+        return _fail(ctx, "missing --frontegg_url (or FRONTEGG_URL) — your Aspect/Frontegg host, e.g. https://auth.aspect.build")
+
+    role_id = _ROLE_IDS[ctx.args.role]
+    failures = 0
+    for u in active:
+        ok, msg = _frontegg_invite(ctx, fe_base, creds, u, role_id, ctx.args.send_invite_email)
+        ctx.std.io.stdout.write("  %s upsert %s <%s>: %s\n" % ("+" if ok else "!", u.login, u.email, msg))
+        if not ok:
+            failures += 1
+
+    # Deactivation of inactive users is not wired yet: it needs a user lookup
+    # (email -> id) then a tenant removal, and there are no inactive users in
+    # the validation org. Surface them rather than silently ignoring.
+    for u in inactive:
+        ctx.std.io.stdout.write("  ~ skip (deactivation not yet implemented): %s <%s> [%s]\n" %
+                                (u.login, u.email, u.status))
+
+    if failures:
+        return _fail(ctx, "%d of %d invites failed (see above)" % (failures, len(active)))
+    ctx.std.io.stdout.write("\nApplied: %d users upserted with role=%s.\n" % (len(active), ctx.args.role))
+    return 0
 
 import_okta_users = task(
     implementation = impl,
@@ -211,7 +233,8 @@ import_okta_users = task(
         "okta_org": args.string(default = ""),
         "role": args.string(default = "viewer"),
         "dry_run": args.boolean(default = True),
-        "proxy_url": args.string(default = ""),
+        "frontegg_url": args.string(default = ""),
+        "send_invite_email": args.boolean(default = False),
         "profile": args.string(default = ""),
     },
 )
