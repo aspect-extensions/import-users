@@ -20,13 +20,18 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = int(os.environ.get("OKTA_MOCK_PORT", "8799"))
 
-PAGE1 = [
+# Active listing is paginated across two pages (exercises Link-header paging).
+ACTIVE_PAGE1 = [
     {"status": "ACTIVE", "profile": {"login": "ada@acme.com", "email": "ada@acme.com",
                                      "firstName": "Ada", "lastName": "Lovelace"}},
+]
+ACTIVE_PAGE2 = [
     {"status": "PROVISIONED", "profile": {"login": "alan@acme.com", "email": "alan@acme.com",
                                           "firstName": "Alan", "lastName": "Turing"}},
 ]
-PAGE2 = [
+# DEPROVISIONED users are only returned under the explicit status filter,
+# mirroring real Okta (the default listing omits them).
+DEPROVISIONED = [
     {"status": "DEPROVISIONED", "profile": {"login": "old@acme.com", "email": "old@acme.com",
                                             "firstName": "Old", "lastName": "User"}},
 ]
@@ -43,10 +48,13 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"[]")
             return
 
-        if "after=PAGE2" in self.path:
-            body, link = json.dumps(PAGE2).encode(), None
+        link = None
+        if "DEPROVISIONED" in self.path:
+            body = json.dumps(DEPROVISIONED).encode()
+        elif "after=PAGE2" in self.path:
+            body = json.dumps(ACTIVE_PAGE2).encode()
         else:
-            body = json.dumps(PAGE1).encode()
+            body = json.dumps(ACTIVE_PAGE1).encode()
             link = '<http://localhost:%d/api/v1/users?limit=200&after=PAGE2>; rel="next"' % PORT
 
         self.send_response(200)

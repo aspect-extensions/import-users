@@ -9,7 +9,7 @@
 The Okta API token comes from the environment (`OKTA_API_TOKEN`) and the Aspect
 identity from `aspect auth` — never from the command line. With no Okta token
 set the command should refuse to run, which is what this test asserts, so CI
-never touches a real Okta org or the userinfo-proxy.
+never touches a real Okta org or Frontegg.
 
 ~~~sh
 # No OKTA_API_TOKEN in the environment -> the command must fail cleanly.

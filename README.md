@@ -1,69 +1,70 @@
 # `aspect import-okta-users`
 
 An [Aspect Extension](https://github.com/aspect-extensions) (AXL) command that
-syncs your **Okta** users into **Frontegg** through Aspect's `userinfo-proxy`.
+syncs your **Okta** users into your Aspect account in **Frontegg**.
 
 It exists because the SCIM path (Okta/Auth0 → SCIM → Frontegg) isn't viable for
 our setup. Instead of a hosted connector, this is **plain, reviewable source**
 you drop into your own repo and run as a daily CI cron job, so your security/IT
 team can audit exactly what it does before adopting it.
 
-> [!WARNING]
-> **The write path is disabled.** Mutating identity from a CI job is a
-> security-sensitive operation. Pending an internal security sign-off and a
-> confirmed `userinfo-proxy` contract (Aspect ticket ENG-1746), this command
-> only **reads** from Okta and prints the changes it *would* make (`--dry-run`,
-> the default). It does not create, modify, or deactivate anyone yet.
+It talks to Frontegg **directly** using the credential from `aspect auth` — no
+intermediary service and no Frontegg secret to manage.
+
+> [!IMPORTANT]
+> With `--dry-run=false` this performs **real** writes (invite / deactivate) in
+> your Frontegg account. It defaults to `--dry-run=true`, which only reads Okta
+> and prints the changes it *would* make. Mutating identity from CI should get a
+> security-team review first (Aspect ticket ENG-1746).
 
 ## What it does
 
 1. Reads users from the Okta admin API — `GET /api/v1/users`, following Okta's
    `Link`-header pagination — and extracts `profile.login`, `profile.email`,
    `firstName`, `lastName`, and `status`.
-2. Computes the reconciliation against **your** Aspect account: upsert active
-   users with a role, deactivate the rest.
-3. (Gated) Pushes those changes to `userinfo-proxy`, which fronts Frontegg with
-   a hard-limited set of capabilities: add user, set role (**Account Admin** or
-   **Account Viewer** only), remove user.
+2. Reconciles them against **your** Aspect account: active Okta users
+   (`ACTIVE`/`PROVISIONED`) are invited with a role; the rest are removed.
+3. Writes to Frontegg with the Account Admin's `aspect auth` token:
+   - invite/create — `POST /identity/resources/users/v2` (role assigned via
+     `roleIds`, invite email suppressed by default),
+   - deactivate — look up by email, then `DELETE /identity/resources/users/v1/{id}`.
 
 ## Security model — which account gets modified
 
-The target account is **not** a flag and **not** a request field. It is read
-from the `tenant_id` claim of the JWT that `aspect auth login` issued, which the
-`userinfo-proxy` re-verifies on every call. Consequences:
+The target account is **not** a flag and **not** a request field. Frontegg
+derives it from the `frontegg-tenant-id` of your signed `aspect auth` token, and
+only honors the write because that token carries the tenant **and** the
+`account.admin` role. Consequences:
 
-- You can only ever modify the **single account your signed token was minted
-  for**. There is no `--account` to point at someone else's tenant, so a
-  misconfigured cron cannot import users into the wrong account.
-- You must `aspect auth login` as an **Account Admin** of that account. The
-  proxy authorizes the caller before any write.
+- You can only ever modify the **single account your token was minted for**.
+  There is no `--account`, so a misconfigured cron cannot touch the wrong
+  account.
+- You must `aspect auth login` as an **Account Admin** of that account.
 - Assignable roles are capped at `viewer` / `admin` (Frontegg keys
-  `account.viewer` / `account.admin`) — the tool can never grant a
-  vendor/super-admin role. Default is `viewer`; granting `admin` requires
-  passing `--role admin` explicitly. The proxy authorizes writes on the
-  caller's `account.admin` role claim and performs the Frontegg change with its
-  own server-side vendor credentials.
-- **No Frontegg token is ever handled by you.** Frontegg vendor credentials
-  live server-side in `userinfo-proxy`; the client only presents its Aspect
-  identity. (This is why there is no `ASPECT_APP_TOKEN` / Frontegg secret.)
+  `account.viewer` / `account.admin`) — never a vendor/super-admin role. Default
+  is `viewer`; granting `admin` requires `--role admin` explicitly.
+- **No Frontegg vendor secret is ever handled.** The client presents only the
+  Account Admin's own Aspect identity; Frontegg authorizes the tenant-scoped
+  user management from that user's `account.admin` permissions.
+- Invites **do not email** users by default. Pass `--send-invite-email` to opt in.
 
 ## Requirements
 
 - The [Aspect CLI](https://docs.aspect.build/) on `PATH`, logged in as an
   Account Admin (`aspect auth login`).
-- Network access to your Okta org and (for the eventual write path) the Aspect
-  `userinfo-proxy` endpoint.
+- Network access to your Okta org and your Aspect/Frontegg host.
 
-## Credentials
+## Credentials & config
 
-| What                   | How                                                          |
-| ---------------------- | ------------------------------------------------------------ |
-| Aspect (the proxy)     | `aspect auth login` as an Account Admin. Read via `aspect auth`; the account scope rides in the signed token. No secret to store. |
-| Okta (read users)      | `OKTA_API_TOKEN` env var. Sent to Okta as `SSWS <token>`.    |
-| `OKTA_ORG`             | Okta org (`acme`) or full base URL. Or use `--okta-org`.     |
+| What            | How                                                                        |
+| --------------- | -------------------------------------------------------------------------- |
+| Aspect identity | `aspect auth login` as an Account Admin. Read via `aspect auth`; the account scope rides in the signed token. No secret to store. |
+| `OKTA_API_TOKEN`| Okta API token, **read-only** access to users. Sent as `SSWS <token>`.     |
+| `OKTA_ORG`      | Okta org (`acme`), hostname (`acme.okta.com`), or URL. Or `--okta-org`.    |
+| `FRONTEGG_URL`  | Your Aspect/Frontegg host (same domain your token was issued by, e.g. `https://auth.aspect.build`). Or `--frontegg-url`. Required for writes. |
 
-The only secret you manage is the Okta API token, and it needs **read-only**
-access to users. Rotate it on your normal cadence.
+The only secret you manage is the read-only Okta API token. Rotate it on your
+normal cadence.
 
 ## Usage
 
@@ -79,24 +80,30 @@ Dry run (default — safe, read-only):
 aspect auth login              # as an Account Admin of the target account
 export OKTA_ORG=acme
 export OKTA_API_TOKEN=…
-aspect import-okta-users       # defaults to --role viewer
+aspect import-okta-users       # defaults to --role viewer, --dry-run=true
+```
+
+Apply for real:
+
+```sh
+aspect import-okta-users --frontegg-url=https://auth.aspect.build --dry-run=false
 ```
 
 Flags:
 
-| Flag          | Default          | Meaning                                          |
-| ------------- | ---------------- | ------------------------------------------------ |
-| `--okta-org`  | `$OKTA_ORG`      | Okta org subdomain or full base URL.             |
-| `--role`      | `viewer`         | Role on upsert: `viewer` or `admin`.             |
-| `--dry-run`   | `true`           | Print planned changes without applying them.     |
-| `--proxy-url` | `$ASPECT_USERINFO_PROXY_URL` | userinfo-proxy base URL.             |
-| `--profile`   | `default`        | Aspect credential profile to use.                |
+| Flag                  | Default     | Meaning                                          |
+| --------------------- | ----------- | ------------------------------------------------ |
+| `--okta-org`          | `$OKTA_ORG` | Okta org subdomain, hostname, or full URL.       |
+| `--role`              | `viewer`    | Role on upsert: `viewer` or `admin`.             |
+| `--dry-run`           | `true`      | Print planned changes without applying them.     |
+| `--frontegg-url`      | `$FRONTEGG_URL` | Aspect/Frontegg host. Required for writes.   |
+| `--send-invite-email` | `false`     | Send Frontegg's invite email (off by default).   |
+| `--profile`           | `default`   | Aspect credential profile to use.                |
 
 ## Running as a daily cron in CI
 
-GitHub Actions example. The only secret is the Okta API token; the Aspect
-identity comes from an API token piped into `aspect auth login` (mint it for a
-dedicated Account Admin service identity of the target account):
+GitHub Actions example. Secrets: the read-only Okta token, plus an Aspect API
+token (mint it for a dedicated Account Admin service identity of the account):
 
 ```yaml
 name: sync-okta-users
@@ -127,13 +134,14 @@ jobs:
         env:
           OKTA_ORG: ${{ vars.OKTA_ORG }}
           OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
-        run: aspect import-okta-users # defaults to viewer; add --dry-run=false once enabled
+          FRONTEGG_URL: ${{ vars.FRONTEGG_URL }}
+        run: aspect import-okta-users --dry-run=false
 ```
 
 ## Validating locally
 
-The read + dry-run path can be exercised end-to-end against a bundled fake Okta,
-so you can see the exact reconciliation output without a real org or any writes.
+The read + dry-run path runs end-to-end against a bundled fake Okta, so you see
+the exact reconciliation output without a real org or any writes.
 
 ```sh
 # 1. Start the fake Okta (serves two paginated pages of users).
@@ -155,16 +163,15 @@ Planned reconciliation for account <your-tenant> (role=viewer):
   - deactivate old@acme.com <old@acme.com> [DEPROVISIONED]
 ```
 
-Against a **real** Okta org, swap step 3 for `--okta-org=<your-org>` and a real
-`OKTA_API_TOKEN`. To validate the (gated) write path later, a reviewer points
-`--proxy-url` at a userinfo-proxy staging instance and drops `--dry_run=false`.
+For a real run, use `--okta-org=<your-org>`, a real `OKTA_API_TOKEN`,
+`--frontegg-url=<your-host>`, and `--dry-run=false`.
 
 ### Targeting a non-production Aspect environment
 
-Select the Aspect auth environment with the `__ASPECT_ENVIRONMENT__` env var
-(`production` default, or `staging` / `dev`). It is resolved on every command
-and credentials are keyed by auth domain, so set it for **both** the login and
-the run, and use a distinct `--profile` to keep it beside your prod login:
+Select the Aspect auth environment with `__ASPECT_ENVIRONMENT__` (`production`
+default, or `staging` / `dev`). It's resolved every command and credentials are
+keyed by auth domain, so set it for **both** the login and the run, and use a
+distinct `--profile` to keep it beside your prod login:
 
 ```sh
 __ASPECT_ENVIRONMENT__=staging aspect auth login --profile staging
@@ -174,6 +181,7 @@ __ASPECT_ENVIRONMENT__=staging OKTA_API_TOKEN=dummy \
 
 ## Status
 
-Read + pagination + dry-run diff + `aspect auth`-derived account scoping:
-implemented. Write path: gated on security sign-off and the `userinfo-proxy`
-contract (ENG-1746).
+Read + pagination + dry-run diff, `aspect auth`-derived account scoping, and the
+write path (invite with role + deactivate, direct to Frontegg) are implemented
+and validated against a live Okta trial + Frontegg account. Mutating identity
+from CI should still get a security-team +1 (ENG-1746).
