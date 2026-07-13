@@ -1,0 +1,6 @@
+"Example module that consumes the import_okta_users task from the parent repo."
+axl_local_dep(
+    name = "import_users",
+    path = "..",
+    auto_use_tasks = True,
+)
