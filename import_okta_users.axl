@@ -155,7 +155,10 @@ def _frontegg_invite(ctx: TaskContext, fe_base: str, creds, user, role_id: str, 
 
     if resp.status in [200, 201]:
         return True, "invited"
-    if resp.status == 409:
+
+    # Frontegg reports an existing user as 409, or 400 with errorCode ER-01086.
+    # Treat that as an idempotent no-op, not a failure.
+    if resp.status == 409 or "ER-01086" in resp.body or "already exists" in resp.body.lower():
         return True, "already in account (skipped)"
     return False, "HTTP %d: %s" % (resp.status, resp.body[:300])
 
