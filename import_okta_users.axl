@@ -1,35 +1,38 @@
 """Sync Okta users into Frontegg via the Aspect userinfo-proxy.
 
 Reads users from the Okta admin API (paginated) and reconciles them against
-an Aspect account through the `userinfo-proxy` layer that fronts Frontegg:
-create user, update role (Admin/Viewer), deactivate user.
+*your own Aspect account* through the `userinfo-proxy` layer that fronts
+Frontegg: create user, set role (Account Admin / Account Viewer), deactivate.
 
 Designed to run as a daily CI cron job. The source is intentionally plain and
 auditable so a customer's security/IT team can review it before adopting it.
 
-Auth (never pass secrets on the command line — read from the environment):
-  OKTA_API_TOKEN    Okta API token, used as `Authorization: SSWS <token>`
-  ASPECT_APP_TOKEN  Aspect app token, used to authenticate to userinfo-proxy
+Account scoping (the security model — see README.md):
+  The target Aspect account is NEVER a flag or a request field. It is taken
+  from the `tenant_id` claim of the JWT that `aspect auth login` issued and
+  the userinfo-proxy re-verifies. A caller can only ever touch the single
+  account their signed token was minted for, so this tool cannot import users
+  into someone else's account even by mistake.
+
+Auth:
+  Aspect: `aspect auth login` (as an Account Admin). This task reads the
+          resulting credential via ctx.aspect.auth — no Aspect/Frontegg token
+          is ever handled by the customer or passed on the command line.
+  Okta:   OKTA_API_TOKEN env var, sent to Okta as `Authorization: SSWS <tok>`.
 
 SECURITY GATE (ENG-1746): mutating identity from a CI job requires a security
-team +1 before the write path is enabled, and the userinfo-proxy contract +
-account scoping are still open questions. Until both land, `dry_run` defaults
-to True and the apply path only prints the planned changes. See README.md.
+team +1 before the write path is enabled, and the userinfo-proxy contract is
+still being confirmed. Until then `dry_run` defaults to True and the apply path
+only prints the planned changes.
 """
 
-# Roles the proxy is allowed to assign. Hard-limited blast radius (ENG-1746).
-_ALLOWED_ROLES = ["Admin", "Viewer"]
+# Roles the proxy is allowed to assign. Hard-limited blast radius (ENG-1746):
+# never vendor/super-admin, only these account-scoped roles.
+_ALLOWED_ROLES = ["Account Admin", "Account Viewer"]
 
 def _fail(ctx: TaskContext, msg: str) -> int:
     ctx.std.io.stderr.write("error: %s\n" % msg)
     return 1
-
-def _require_env(ctx: TaskContext, name: str):
-    """Read a required environment variable or return None (caller errors)."""
-    value = ctx.std.env.var(name)
-    if not value:
-        return None
-    return value
 
 def _okta_base_url(org: str) -> str:
     """Accept either a bare org (`acme`) or a full base URL."""
@@ -37,72 +40,78 @@ def _okta_base_url(org: str) -> str:
         return org.rstrip("/")
     return "https://%s.okta.com" % org
 
-def _curl_json(ctx: TaskContext, url: str, headers: list[str]):
-    """GET `url` with `headers`, returning (parsed_body, next_url, error).
+def _next_link(headers) -> str:
+    """Extract the rel="next" URL from an HTTP Link header (Okta pagination).
 
-    Uses curl so the network surface is explicit and reviewable. The response
-    headers are dumped to a temp file so we can follow Okta's Link-header
-    pagination (`Link: <url>; rel="next"`).
+    `headers` is the list of (name, value) tuples from an HttpResponse.
     """
-    header_file = ctx.std.env.temp_dir() + "/okta_headers.txt"
-    cmd = ctx.std.process.command("curl") \
-        .args(["-sS", "--fail-with-body", "-D", header_file, "-X", "GET", url])
-    for h in headers:
-        cmd = cmd.args(["-H", h])
-    result = cmd.stdout("piped").spawn().wait_with_output()
-    if not result.status.success:
-        return None, None, "okta request failed (exit %s): %s" % (result.status.code, result.stderr)
-
-    body = json.decode(result.stdout)
-    next_url = _parse_next_link(ctx.std.fs.read_to_string(header_file))
-    return body, next_url, None
-
-def _parse_next_link(header_text: str):
-    """Extract the rel="next" URL from a raw HTTP Link header block."""
-    for line in header_text.splitlines():
-        low = line.lower()
-        if not low.startswith("link:") or "rel=\"next\"" not in low:
+    for (name, value) in headers:
+        if name.lower() != "link" or "rel=\"next\"" not in value:
             continue
-        start = line.find("<")
-        end = line.find(">", start)
-        if start != -1 and end != -1:
-            return line[start + 1:end]
-    return None
 
-def _fetch_okta_users(ctx: TaskContext, base_url: str, token: str):
-    """Return (users, error). Paginates through /api/v1/users."""
-    headers = [
-        "Authorization: SSWS %s" % token,
-        "Accept: application/json",
-    ]
-    users = []
-    url = base_url + "/api/v1/users?limit=200"
-    page = 0
-    for _ in range(1000):  # hard page cap; guards against a pagination loop
-        page += 1
-        ctx.std.io.stdout.write("Fetching Okta users page %d...\n" % page)
-        body, next_url, error = _curl_json(ctx, url, headers)
-        if error:
-            return None, error
-        for u in body:
-            users.append(_normalize_okta_user(u))
-        if not next_url:
-            break
-        url = next_url
-    return users, None
+        # A Link header may carry several comma-separated links; find next.
+        for part in value.split(","):
+            if "rel=\"next\"" not in part:
+                continue
+            start = part.find("<")
+            end = part.find(">", start)
+            if start != -1 and end != -1:
+                return part[start + 1:end]
+    return ""
 
 def _normalize_okta_user(u) -> struct:
     """Flatten an Okta user record to the fields we sync."""
     profile = u.get("profile", {})
+    status = u.get("status", "")
     return struct(
         login = profile.get("login", ""),
         email = profile.get("email", ""),
         first_name = profile.get("firstName", ""),
         last_name = profile.get("lastName", ""),
         # Okta status: ACTIVE, PROVISIONED, DEPROVISIONED, SUSPENDED, ...
-        status = u.get("status", ""),
-        active = u.get("status", "") in ["ACTIVE", "PROVISIONED"],
+        status = status,
+        active = status in ["ACTIVE", "PROVISIONED"],
     )
+
+def _fetch_okta_users(ctx: TaskContext, base_url: str, token: str):
+    """Return (users, error). Paginates /api/v1/users via the Link header."""
+    headers = {
+        "Authorization": "SSWS %s" % token,
+        "Accept": "application/json",
+    }
+    users = []
+    url = base_url + "/api/v1/users?limit=200"
+    for page in range(1, 1001):  # hard page cap guards against a pagination loop
+        ctx.std.io.stdout.write("Fetching Okta users page %d...\n" % page)
+        response = ctx.http().get(url = url, headers = headers).block()
+        if response.status == 401 or response.status == 403:
+            return None, "Okta rejected the API token (HTTP %d)" % response.status
+        if response.status != 200:
+            return None, "Okta request failed: HTTP %d: %s" % (response.status, response.body[:200])
+
+        batch = json.try_decode(response.body, None)
+        if batch == None:
+            return None, "Okta returned non-JSON body: %s" % response.body[:200]
+        for u in batch:
+            users.append(_normalize_okta_user(u))
+
+        url = _next_link(response.headers)
+        if not url:
+            return users, None
+    return None, "exceeded pagination cap (1000 pages)"
+
+def _aspect_identity(ctx: TaskContext):
+    """Return (creds, error). Credentials come from `aspect auth login`.
+
+    The tenant/account is whatever the signed token carries — it is not, and
+    must not be, selectable from here.
+    """
+    creds = ctx.aspect.auth.credentials(profile = ctx.args.profile)
+    if creds == None:
+        return None, "not logged in to Aspect — run `aspect auth login` as an Account Admin"
+    if "expired" in creds.token_status.lower():
+        return None, "Aspect credential expired — run `aspect auth login` to refresh"
+    return creds, None
 
 # buildifier: disable=function-docstring
 def impl(ctx: TaskContext) -> int:
@@ -110,9 +119,22 @@ def impl(ctx: TaskContext) -> int:
     if not okta_org:
         return _fail(ctx, "missing --okta_org (or OKTA_ORG env var)")
 
-    okta_token = _require_env(ctx, "OKTA_API_TOKEN")
+    okta_token = ctx.std.env.var("OKTA_API_TOKEN")
     if not okta_token:
         return _fail(ctx, "missing OKTA_API_TOKEN env var")
+
+    if ctx.args.role not in _ALLOWED_ROLES:
+        return _fail(ctx, "role %r not allowed; choose one of %s" % (ctx.args.role, _ALLOWED_ROLES))
+
+    # Resolve WHO we are and WHICH account we may touch, straight from the
+    # signed Aspect credential. This is the only source of the account scope.
+    creds, error = _aspect_identity(ctx)
+    if error:
+        return _fail(ctx, error)
+    ctx.std.io.stdout.write(
+        "Aspect identity: %s <%s>\nTarget account (tenant): %s  [from signed token — not overridable]\n" %
+        (creds.name, creds.email, creds.tenant_id),
+    )
 
     base_url = _okta_base_url(okta_org)
     ctx.std.io.stdout.write("Okta org: %s\n" % base_url)
@@ -129,9 +151,10 @@ def impl(ctx: TaskContext) -> int:
     )
 
     # Dry-run diff: this is exactly the artifact the security review needs.
-    ctx.std.io.stdout.write("\nPlanned Frontegg reconciliation (role=%s):\n" % ctx.args.role)
+    ctx.std.io.stdout.write("\nPlanned reconciliation for account %s (role=%s):\n" %
+                            (creds.tenant_id, ctx.args.role))
     for u in active:
-        ctx.std.io.stdout.write("  + upsert  %s <%s> (%s %s)\n" %
+        ctx.std.io.stdout.write("  + upsert     %s <%s> (%s %s)\n" %
                                 (u.login, u.email, u.first_name, u.last_name))
     for u in inactive:
         ctx.std.io.stdout.write("  - deactivate %s <%s> [%s]\n" % (u.login, u.email, u.status))
@@ -142,15 +165,22 @@ def impl(ctx: TaskContext) -> int:
 
     # ----------------------------------------------------------------------
     # WRITE PATH — DISABLED pending ENG-1746 security +1 and a confirmed
-    # userinfo-proxy contract (endpoints, auth, account scoping). Do NOT
-    # enable without both. Intended shape, once approved & contract confirmed:
-    #   proxy_url  = ctx.args.proxy_url or ctx.std.env.var("ASPECT_USERINFO_PROXY_URL")
-    #   app_token  = _require_env(ctx, "ASPECT_APP_TOKEN")
-    #   for u in active:   _proxy_upsert(ctx, proxy_url, app_token, u, ctx.args.role)
-    #   for u in inactive: _proxy_deactivate(ctx, proxy_url, app_token, u)
+    # userinfo-proxy contract. Do NOT enable without both. Intended shape:
+    #
+    #   proxy = ctx.args.proxy_url or ctx.std.env.var("ASPECT_USERINFO_PROXY_URL")
+    #   auth  = {"Authorization": "Bearer " + creds.access_token,
+    #            "Content-Type": "application/json"}
+    #   # NOTE: no account/tenant field in the body or URL. The proxy MUST
+    #   # verify the JWT, read tenant_id from it, and act only on that tenant;
+    #   # it MUST reject any client-supplied account and require Account Admin.
+    #   for u in active:
+    #       ctx.http().post(url = proxy + "/users", headers = auth,
+    #           data = json.encode({"email": u.email, "firstName": u.first_name,
+    #                               "lastName": u.last_name, "role": ctx.args.role})).block()
+    #   for u in inactive:
+    #       ctx.http().post(url = proxy + "/users/deactivate", headers = auth,
+    #           data = json.encode({"email": u.email})).block()
     # ----------------------------------------------------------------------
-    if ctx.args.role not in _ALLOWED_ROLES:
-        return _fail(ctx, "role %r not in allowed set %s" % (ctx.args.role, _ALLOWED_ROLES))
     return _fail(
         ctx,
         "apply path is gated: awaiting security sign-off + userinfo-proxy " +
@@ -161,8 +191,9 @@ import_okta_users = task(
     implementation = impl,
     args = {
         "okta_org": args.string(default = ""),
-        "role": args.string(default = "Viewer"),
+        "role": args.string(default = "Account Viewer"),
         "dry_run": args.boolean(default = True),
         "proxy_url": args.string(default = ""),
+        "profile": args.string(default = ""),
     },
 )

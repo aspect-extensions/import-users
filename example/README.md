@@ -6,10 +6,10 @@
 
 ## Try it out
 
-The task reads its secrets from the environment (`OKTA_API_TOKEN`,
-`ASPECT_APP_TOKEN`) and never from the command line. With no token set it
-should refuse to run — that's what this test asserts, so CI never touches a
-real Okta org or the userinfo-proxy.
+The Okta API token comes from the environment (`OKTA_API_TOKEN`) and the Aspect
+identity from `aspect auth` — never from the command line. With no Okta token
+set the command should refuse to run, which is what this test asserts, so CI
+never touches a real Okta org or the userinfo-proxy.
 
 ~~~sh
 # No OKTA_API_TOKEN in the environment -> the command must fail cleanly.
