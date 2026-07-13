@@ -1,0 +1,176 @@
+"""Shared, IdP-agnostic core for the `import-users` task group.
+
+A per-IdP reader (okta.axl, and future entra.axl / google.axl / ...) fetches and
+normalizes users, then calls `reconcile(ctx, users)`. Each user is a struct with
+fields: login, email, first_name, last_name, status, active. Everything below —
+the aspect-auth identity, the Frontegg client, and the reconcile/dry-run/apply
+loop — is provider-agnostic and reused by every reader.
+
+Readers should expose these task args (plus their own, e.g. okta_org):
+role, dry_run, frontegg_url, send_invite_email, profile.
+
+Security model: the target account is never a flag or a request field. Frontegg
+derives it from the `frontegg-tenant-id` of the signed `aspect auth` token and
+only honors the write because that token carries the tenant + the account.admin
+role. A caller can only ever manage users in their own account. No Frontegg
+vendor secret is ever handled by the customer.
+"""
+
+# Simple role name (`--role viewer` / `--role admin`) -> Frontegg role id.
+# Hard-limited blast radius: only these two account-scoped roles, never
+# vendor/super-admin. These are the Aspect Frontegg vendor's role ids (all
+# Aspect accounts are tenants under that vendor, so the ids are stable).
+_ROLE_IDS = {
+    "viewer": "8e00df9e-c6fc-40c4-9429-b46459c4499a",  # account.viewer
+    "admin": "a33dfcdf-7d8c-48c0-beeb-b9d3b384cf06",  # account.admin
+}
+_ALLOWED_ROLES = list(_ROLE_IDS)
+
+def fail(ctx: TaskContext, msg: str) -> int:
+    """Print an error and return exit code 1. Shared by readers and the core."""
+    ctx.std.io.stderr.write("error: %s\n" % msg)
+    return 1
+
+def _aspect_identity(ctx: TaskContext):
+    """Return (creds, error). Credentials come from `aspect auth login`.
+
+    The tenant/account is whatever the signed token carries — it is not, and
+    must not be, selectable.
+    """
+    creds = ctx.aspect.auth.credentials(profile = ctx.args.profile)
+    if creds == None:
+        return None, "not logged in to Aspect — run `aspect auth login` as an Account Admin"
+    if "expired" in creds.token_status.lower():
+        return None, "Aspect credential expired — run `aspect auth login` to refresh"
+    return creds, None
+
+def _frontegg_invite(ctx: TaskContext, fe_base: str, creds, user, role_id: str, send_email: bool):
+    """Invite/create one user in the caller's Frontegg tenant. Returns (ok, msg).
+
+    Uses the Account Admin's Aspect JWT as the bearer; Frontegg scopes the write
+    to the tenant in `frontegg-tenant-id` because the token authorizes it.
+    """
+    headers = {
+        "Authorization": "Bearer %s" % creds.access_token,
+        "Content-Type": "application/json",
+        "frontegg-tenant-id": creds.tenant_id,
+    }
+    body = {
+        "email": user.email,
+        "name": ("%s %s" % (user.first_name, user.last_name)).strip() or user.email,
+        "roleIds": [role_id],
+        "skipInviteEmail": not send_email,
+    }
+    resp = ctx.http().post(
+        url = fe_base + "/identity/resources/users/v2",
+        headers = headers,
+        data = json.encode(body),
+    ).block()
+
+    if resp.status in [200, 201]:
+        return True, "invited"
+
+    # Frontegg reports an existing user as 409, or 400 with errorCode ER-01086.
+    # Treat that as an idempotent no-op, not a failure.
+    if resp.status == 409 or "ER-01086" in resp.body or "already exists" in resp.body.lower():
+        return True, "already in account (skipped)"
+    return False, "HTTP %d: %s" % (resp.status, resp.body[:300])
+
+def _frontegg_find_user_id(ctx: TaskContext, fe_base: str, creds, email: str):
+    """Look up a user's Frontegg id by email within the caller's tenant.
+
+    Returns (user_id, error); user_id is None if no such user (not an error).
+    """
+    headers = {
+        "Authorization": "Bearer %s" % creds.access_token,
+        "frontegg-tenant-id": creds.tenant_id,
+        "Accept": "application/json",
+    }
+
+    # `@` must be percent-encoded in the query string.
+    url = fe_base + "/identity/resources/users/v3?_limit=1&_email=" + email.replace("@", "%40")
+    resp = ctx.http().get(url = url, headers = headers).block()
+    if resp.status != 200:
+        return None, "lookup HTTP %d: %s" % (resp.status, resp.body[:200])
+
+    data = json.try_decode(resp.body, {})
+    for item in (data.get("items", []) if data else []):
+        if item.get("email", "").lower() == email.lower():
+            return item.get("id"), None
+    return None, None
+
+def _frontegg_deactivate(ctx: TaskContext, fe_base: str, creds, user):
+    """Remove one user from the caller's Frontegg tenant. Returns (ok, msg)."""
+    user_id, error = _frontegg_find_user_id(ctx, fe_base, creds, user.email)
+    if error:
+        return False, error
+    if not user_id:
+        return True, "not in account (nothing to do)"
+
+    headers = {
+        "Authorization": "Bearer %s" % creds.access_token,
+        "frontegg-tenant-id": creds.tenant_id,
+    }
+    resp = ctx.http().delete(
+        url = fe_base + "/identity/resources/users/v1/" + user_id,
+        headers = headers,
+    ).block()
+    if resp.status in [200, 204]:
+        return True, "removed"
+    return False, "HTTP %d: %s" % (resp.status, resp.body[:300])
+
+# Reconcile normalized `users` into the caller's Frontegg account: print the
+# planned diff, then (unless --dry-run) invite active users with the chosen role
+# and remove inactive ones. Returns an exit code.
+# buildifier: disable=function-docstring
+def reconcile(ctx: TaskContext, users) -> int:
+    if ctx.args.role not in _ALLOWED_ROLES:
+        return fail(ctx, "role %r not allowed; choose one of %s" % (ctx.args.role, _ALLOWED_ROLES))
+
+    creds, error = _aspect_identity(ctx)
+    if error:
+        return fail(ctx, error)
+
+    out = ctx.std.io.stdout
+    out.write(
+        "Aspect identity: %s <%s>\nTarget account (tenant): %s  [from signed token — not overridable]\n" %
+        (creds.name, creds.email, creds.tenant_id),
+    )
+
+    active = [u for u in users if u.active]
+    inactive = [u for u in users if not u.active]
+    out.write("Reconciling %d users (%d active, %d inactive).\n" % (len(users), len(active), len(inactive)))
+
+    out.write("\nPlanned reconciliation for account %s (role=%s):\n" % (creds.tenant_id, ctx.args.role))
+    for u in active:
+        out.write("  + upsert     %s <%s> (%s %s)\n" % (u.login, u.email, u.first_name, u.last_name))
+    for u in inactive:
+        out.write("  - deactivate %s <%s> [%s]\n" % (u.login, u.email, u.status))
+
+    if ctx.args.dry_run:
+        out.write("\ndry-run: no changes pushed. This is a preview; the default applies.\n")
+        return 0
+
+    fe_base = (ctx.args.frontegg_url or ctx.std.env.var("FRONTEGG_URL") or "").rstrip("/")
+    if not fe_base:
+        return fail(ctx, "missing --frontegg_url (or FRONTEGG_URL) — your Aspect/Frontegg host, e.g. https://auth.aspect.build")
+
+    out.write("\nAPPLYING to account %s (not a dry run; pass --dry-run to preview).\n" % creds.tenant_id)
+    role_id = _ROLE_IDS[ctx.args.role]
+    failures = 0
+    for u in active:
+        ok, msg = _frontegg_invite(ctx, fe_base, creds, u, role_id, ctx.args.send_invite_email)
+        out.write("  %s upsert %s <%s>: %s\n" % ("+" if ok else "!", u.login, u.email, msg))
+        if not ok:
+            failures += 1
+
+    for u in inactive:
+        ok, msg = _frontegg_deactivate(ctx, fe_base, creds, u)
+        out.write("  %s deactivate %s <%s>: %s\n" % ("-" if ok else "!", u.login, u.email, msg))
+        if not ok:
+            failures += 1
+
+    if failures:
+        return fail(ctx, "%d of %d operations failed (see above)" % (failures, len(active) + len(inactive)))
+    out.write("\nApplied: %d upserted (role=%s), %d deactivated.\n" % (len(active), ctx.args.role, len(inactive)))
+    return 0

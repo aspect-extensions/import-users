@@ -1,0 +1,139 @@
+"""`aspect import-users okta` — sync Okta users into your Aspect Frontegg account.
+
+Okta-specific reader: reads users from the Okta admin API (paginated), maps them
+to the shared normalized shape, and hands off to the IdP-agnostic core in
+frontegg.axl. Everything Okta — its argument, its API token, base-URL handling,
+Link-header pagination, and status/field mapping — lives here.
+
+Auth: OKTA_API_TOKEN env var, sent to Okta as `Authorization: SSWS <token>`.
+"""
+
+load("./frontegg.axl", "fail", "reconcile")
+
+def _okta_base_url(org: str) -> str:
+    """Normalize to a base URL.
+
+    Accepts a bare org (`acme`), a full hostname (`acme.okta.com`), or a full
+    URL (`https://acme.okta.com`).
+    """
+    o = org.rstrip("/")
+    if o.startswith("http://") or o.startswith("https://"):
+        return o
+    if "." in o:  # already a hostname, e.g. acme.okta.com — don't re-suffix
+        return "https://%s" % o
+    return "https://%s.okta.com" % o
+
+def _next_link(headers) -> str:
+    """Extract the rel="next" URL from an HTTP Link header (Okta pagination).
+
+    `headers` is the list of (name, value) tuples from an HttpResponse.
+    """
+    for (name, value) in headers:
+        if name.lower() != "link" or "rel=\"next\"" not in value:
+            continue
+
+        # A Link header may carry several comma-separated links; find next.
+        for part in value.split(","):
+            if "rel=\"next\"" not in part:
+                continue
+            start = part.find("<")
+            end = part.find(">", start)
+            if start != -1 and end != -1:
+                return part[start + 1:end]
+    return ""
+
+def _normalize_okta_user(u) -> struct:
+    """Flatten an Okta user record to the shared normalized shape."""
+    profile = u.get("profile", {})
+    status = u.get("status", "")
+    return struct(
+        login = profile.get("login", ""),
+        email = profile.get("email", ""),
+        first_name = profile.get("firstName", ""),
+        last_name = profile.get("lastName", ""),
+        # Okta status: ACTIVE, PROVISIONED, DEPROVISIONED, SUSPENDED, ...
+        status = status,
+        active = status in ["ACTIVE", "PROVISIONED"],
+    )
+
+def _okta_get_all(ctx: TaskContext, url: str, token: str, label: str):
+    """Paginate one Okta /api/v1/users query via the Link header.
+
+    Returns (users, error).
+    """
+    headers = {
+        "Authorization": "SSWS %s" % token,
+        "Accept": "application/json",
+    }
+    users = []
+    for page in range(1, 1001):  # hard page cap guards against a pagination loop
+        ctx.std.io.stdout.write("Fetching Okta users (%s) page %d...\n" % (label, page))
+        response = ctx.http().get(url = url, headers = headers).block()
+        if response.status == 401 or response.status == 403:
+            return None, "Okta rejected the API token (HTTP %d)" % response.status
+        if response.status != 200:
+            return None, "Okta request failed: HTTP %d: %s" % (response.status, response.body[:200])
+
+        batch = json.try_decode(response.body, None)
+        if batch == None:
+            return None, "Okta returned non-JSON body: %s" % response.body[:200]
+        for u in batch:
+            users.append(_normalize_okta_user(u))
+
+        url = _next_link(response.headers)
+        if not url:
+            return users, None
+    return None, "exceeded pagination cap (1000 pages)"
+
+def _fetch_okta_users(ctx: TaskContext, base_url: str, token: str):
+    """Return (users, error).
+
+    Okta's default listing omits DEPROVISIONED users, but those are exactly the
+    ones we must remove from Frontegg, so we query them explicitly too. Active
+    and SUSPENDED users come from the default listing.
+    """
+    listed, error = _okta_get_all(ctx, base_url + "/api/v1/users?limit=200", token, "active")
+    if error:
+        return None, error
+
+    # filter=status eq "DEPROVISIONED", percent-encoded.
+    deprov_query = "/api/v1/users?limit=200&filter=status%20eq%20%22DEPROVISIONED%22"
+    deprovisioned, error = _okta_get_all(ctx, base_url + deprov_query, token, "deprovisioned")
+    if error:
+        return None, error
+
+    return listed + deprovisioned, None
+
+# buildifier: disable=function-docstring
+def impl(ctx: TaskContext) -> int:
+    okta_org = ctx.args.okta_org or ctx.std.env.var("OKTA_ORG")
+    if not okta_org:
+        return fail(ctx, "missing --okta_org (or OKTA_ORG env var)")
+
+    okta_token = ctx.std.env.var("OKTA_API_TOKEN")
+    if not okta_token:
+        return fail(ctx, "missing OKTA_API_TOKEN env var")
+
+    base_url = _okta_base_url(okta_org)
+    ctx.std.io.stdout.write("Okta org: %s\n" % base_url)
+
+    users, error = _fetch_okta_users(ctx, base_url, okta_token)
+    if error:
+        return fail(ctx, error)
+
+    return reconcile(ctx, users)
+
+okta = task(
+    group = ["import-users"],
+    implementation = impl,
+    args = {
+        # Okta-specific:
+        "okta_org": args.string(default = ""),
+        # Shared with every import-users reader (see frontegg.axl):
+        "role": args.string(default = "viewer"),
+        "dry_run": args.boolean(default = False),
+        "frontegg_url": args.string(default = ""),
+        "send_invite_email": args.boolean(default = False),
+        "profile": args.string(default = ""),
+    },
+)

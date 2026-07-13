@@ -1,7 +1,8 @@
-# `aspect import-okta-users`
+# `aspect import-users okta`
 
-An [Aspect Extension](https://github.com/aspect-extensions) (AXL) command that
-syncs your **Okta** users into your Aspect account in **Frontegg**.
+An [Aspect Extension](https://github.com/aspect-extensions) (AXL) task group —
+`aspect import-users <idp>` — that syncs users from your identity provider into
+your Aspect account in **Frontegg**. **`okta`** is the first provider.
 
 It exists because the SCIM path (Okta/Auth0 → SCIM → Frontegg) isn't viable for
 our setup. Instead of a hosted connector, this is **plain, reviewable source**
@@ -10,6 +11,10 @@ team can audit exactly what it does before adopting it.
 
 It talks to Frontegg **directly** using the credential from `aspect auth` — no
 intermediary service and no Frontegg secret to manage.
+
+**Structure:** the Frontegg sync (identity, invite/deactivate, reconcile) lives
+in the shared, provider-agnostic `frontegg.axl`; each provider is a thin reader
+(`okta.axl`, …) that fetches and normalizes users. Adding an IdP = one reader.
 
 > [!IMPORTANT]
 > This **applies changes by default** (invite / deactivate in your Frontegg
@@ -80,13 +85,13 @@ Preview (read-only — pass `--dry-run`):
 aspect auth login              # as an Account Admin of the target account
 export OKTA_ORG=acme
 export OKTA_API_TOKEN=…
-aspect import-okta-users --dry-run
+aspect import-users okta --dry-run
 ```
 
 Apply (the default):
 
 ```sh
-aspect import-okta-users --frontegg-url=https://auth.aspect.build
+aspect import-users okta --frontegg-url=https://auth.aspect.build
 ```
 
 Flags:
@@ -135,7 +140,7 @@ jobs:
           OKTA_ORG: ${{ vars.OKTA_ORG }}
           OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
           FRONTEGG_URL: ${{ vars.FRONTEGG_URL }}
-        run: aspect import-okta-users # applies by default
+        run: aspect import-users okta # applies by default
 ```
 
 ## Validating locally
@@ -152,7 +157,7 @@ aspect auth login
 
 # 3. Point the tool at the mock. --dry-run previews without writing;
 #    OKTA_API_TOKEN can be any non-empty value.
-OKTA_API_TOKEN=dummy aspect import-okta-users --okta-org=http://localhost:8799 --dry-run
+OKTA_API_TOKEN=dummy aspect import-users okta --okta-org=http://localhost:8799 --dry-run
 ```
 
 Expected dry-run output:
@@ -177,7 +182,7 @@ distinct `--profile` to keep it beside your prod login:
 ```sh
 __ASPECT_ENVIRONMENT__=staging aspect auth login --profile staging
 __ASPECT_ENVIRONMENT__=staging OKTA_API_TOKEN=dummy \
-  aspect import-okta-users --okta-org=http://localhost:8799 --profile staging --dry-run
+  aspect import-users okta --okta-org=http://localhost:8799 --profile staging --dry-run
 ```
 
 ## Status

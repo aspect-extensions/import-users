@@ -1,4 +1,4 @@
-# `aspect import-okta-users` example
+# `aspect import-users okta` example
 
     # This is executable Markdown that's tested on CI.
     set -o errexit -o nounset -o xtrace
@@ -13,7 +13,7 @@ never touches a real Okta org or Frontegg.
 
 ~~~sh
 # No OKTA_API_TOKEN in the environment -> the command must fail cleanly.
-output="$(env -u OKTA_API_TOKEN aspect import-okta-users --okta-org=example 2>&1 || true)"
+output="$(env -u OKTA_API_TOKEN aspect import-users okta --okta-org=example 2>&1 || true)"
 
 echo "${output}" | grep -q "missing OKTA_API_TOKEN" || {
     echo >&2 "Wanted an error mentioning 'missing OKTA_API_TOKEN' but got: '${output}'"
