@@ -22,16 +22,16 @@ jobs:
       - uses: actions/checkout@v5
       - uses: bazel-contrib/setup-bazel@0.15.0
       - name: Install Aspect CLI
-        uses: jaxxstorm/action-install-gh-release@v2.1.0
-        with:
-          repo: aspect-build/aspect-cli
-          tag: v2026.28.13
-          asset-name: aspect-cli
-          platform: unknown_linux
-          arch: x86_64
-          extension-matching: disable
-          rename-to: aspect
-          chmod: 0755
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASPECT_CLI_VERSION: v2026.28.13
+        run: |
+          gh release download "$ASPECT_CLI_VERSION" \
+            --repo aspect-build/aspect-cli \
+            --pattern aspect-cli-x86_64-unknown-linux-musl \
+            --output "$RUNNER_TEMP/aspect"
+          chmod +x "$RUNNER_TEMP/aspect"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: Test
         working-directory: example
         shell: sh
