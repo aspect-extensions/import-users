@@ -159,6 +159,19 @@ Against a **real** Okta org, swap step 3 for `--okta-org=<your-org>` and a real
 `OKTA_API_TOKEN`. To validate the (gated) write path later, a reviewer points
 `--proxy-url` at a userinfo-proxy staging instance and drops `--dry_run=false`.
 
+### Targeting a non-production Aspect environment
+
+Select the Aspect auth environment with the `__ASPECT_ENVIRONMENT__` env var
+(`production` default, or `staging` / `dev`). It is resolved on every command
+and credentials are keyed by auth domain, so set it for **both** the login and
+the run, and use a distinct `--profile` to keep it beside your prod login:
+
+```sh
+__ASPECT_ENVIRONMENT__=staging aspect auth login --profile staging
+__ASPECT_ENVIRONMENT__=staging OKTA_API_TOKEN=dummy \
+  aspect import-okta-users --okta-org=http://localhost:8799 --profile staging
+```
+
 ## Status
 
 Read + pagination + dry-run diff + `aspect auth`-derived account scoping:
