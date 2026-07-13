@@ -26,15 +26,17 @@ still being confirmed. Until then `dry_run` defaults to True and the apply path
 only prints the planned changes.
 """
 
-# Roles the proxy is allowed to assign, mapped from the display name the
-# operator types to the Frontegg role key the proxy uses. Hard-limited blast
-# radius (ENG-1746): never vendor/super-admin, only these account-scoped roles.
+# Roles the proxy is allowed to assign, mapped from the simple name the operator
+# passes (`--role viewer` / `--role admin`) to the Frontegg role key the proxy
+# uses. Hard-limited blast radius (ENG-1746): never vendor/super-admin, only
+# these account-scoped roles. Default is "viewer" — granting admin must be an
+# explicit, deliberate choice.
 # NOTE: "account.admin" is confirmed from a real token's `roles` claim;
 # "account.viewer" is inferred by symmetry — confirm against the Frontegg role
 # config before enabling the write path.
 _ROLE_KEYS = {
-    "Account Admin": "account.admin",
-    "Account Viewer": "account.viewer",
+    "viewer": "account.viewer",
+    "admin": "account.admin",
 }
 _ALLOWED_ROLES = list(_ROLE_KEYS)
 
@@ -207,7 +209,7 @@ import_okta_users = task(
     implementation = impl,
     args = {
         "okta_org": args.string(default = ""),
-        "role": args.string(default = "Account Viewer"),
+        "role": args.string(default = "viewer"),
         "dry_run": args.boolean(default = True),
         "proxy_url": args.string(default = ""),
         "profile": args.string(default = ""),

@@ -37,11 +37,12 @@ from the `tenant_id` claim of the JWT that `aspect auth login` issued, which the
   misconfigured cron cannot import users into the wrong account.
 - You must `aspect auth login` as an **Account Admin** of that account. The
   proxy authorizes the caller before any write.
-- Assignable roles are capped at `Account Admin` / `Account Viewer` (Frontegg
-  keys `account.admin` / `account.viewer`) — the tool can never grant a
-  vendor/super-admin role. The proxy authorizes writes on the caller's
-  `account.admin` role claim and performs the Frontegg change with its own
-  server-side vendor credentials.
+- Assignable roles are capped at `viewer` / `admin` (Frontegg keys
+  `account.viewer` / `account.admin`) — the tool can never grant a
+  vendor/super-admin role. Default is `viewer`; granting `admin` requires
+  passing `--role admin` explicitly. The proxy authorizes writes on the
+  caller's `account.admin` role claim and performs the Frontegg change with its
+  own server-side vendor credentials.
 - **No Frontegg token is ever handled by you.** Frontegg vendor credentials
   live server-side in `userinfo-proxy`; the client only presents its Aspect
   identity. (This is why there is no `ASPECT_APP_TOKEN` / Frontegg secret.)
@@ -78,7 +79,7 @@ Dry run (default — safe, read-only):
 aspect auth login              # as an Account Admin of the target account
 export OKTA_ORG=acme
 export OKTA_API_TOKEN=…
-aspect import-okta-users --role="Account Viewer"
+aspect import-okta-users       # defaults to --role viewer
 ```
 
 Flags:
@@ -86,7 +87,7 @@ Flags:
 | Flag          | Default          | Meaning                                          |
 | ------------- | ---------------- | ------------------------------------------------ |
 | `--okta-org`  | `$OKTA_ORG`      | Okta org subdomain or full base URL.             |
-| `--role`      | `Account Viewer` | Role on upsert (`Account Admin`/`Account Viewer`). |
+| `--role`      | `viewer`         | Role on upsert: `viewer` or `admin`.             |
 | `--dry-run`   | `true`           | Print planned changes without applying them.     |
 | `--proxy-url` | `$ASPECT_USERINFO_PROXY_URL` | userinfo-proxy base URL.             |
 | `--profile`   | `default`        | Aspect credential profile to use.                |
@@ -126,7 +127,7 @@ jobs:
         env:
           OKTA_ORG: ${{ vars.OKTA_ORG }}
           OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
-        run: aspect import-okta-users --role="Account Viewer" # add --dry-run=false once enabled
+        run: aspect import-okta-users # defaults to viewer; add --dry-run=false once enabled
 ```
 
 ## Status
