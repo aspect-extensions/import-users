@@ -130,6 +130,35 @@ jobs:
         run: aspect import-okta-users # defaults to viewer; add --dry-run=false once enabled
 ```
 
+## Validating locally
+
+The read + dry-run path can be exercised end-to-end against a bundled fake Okta,
+so you can see the exact reconciliation output without a real org or any writes.
+
+```sh
+# 1. Start the fake Okta (serves two paginated pages of users).
+python3 test/mock_okta.py &
+
+# 2. Authenticate to Aspect (the tool refuses to run otherwise).
+aspect auth login
+
+# 3. Point the tool at the mock. OKTA_API_TOKEN can be any non-empty value.
+OKTA_API_TOKEN=dummy aspect import-okta-users --okta-org=http://localhost:8799
+```
+
+Expected dry-run output:
+
+```
+Planned reconciliation for account <your-tenant> (role=viewer):
+  + upsert     ada@acme.com <ada@acme.com> (Ada Lovelace)
+  + upsert     alan@acme.com <alan@acme.com> (Alan Turing)
+  - deactivate old@acme.com <old@acme.com> [DEPROVISIONED]
+```
+
+Against a **real** Okta org, swap step 3 for `--okta-org=<your-org>` and a real
+`OKTA_API_TOKEN`. To validate the (gated) write path later, a reviewer points
+`--proxy-url` at a userinfo-proxy staging instance and drops `--dry_run=false`.
+
 ## Status
 
 Read + pagination + dry-run diff + `aspect auth`-derived account scoping:
