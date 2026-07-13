@@ -45,10 +45,17 @@ def _fail(ctx: TaskContext, msg: str) -> int:
     return 1
 
 def _okta_base_url(org: str) -> str:
-    """Accept either a bare org (`acme`) or a full base URL."""
-    if org.startswith("http://") or org.startswith("https://"):
-        return org.rstrip("/")
-    return "https://%s.okta.com" % org
+    """Normalize to a base URL.
+
+    Accepts a bare org (`acme`), a full hostname (`acme.okta.com`), or a full
+    URL (`https://acme.okta.com`).
+    """
+    o = org.rstrip("/")
+    if o.startswith("http://") or o.startswith("https://"):
+        return o
+    if "." in o:  # already a hostname, e.g. acme.okta.com — don't re-suffix
+        return "https://%s" % o
+    return "https://%s.okta.com" % o
 
 def _next_link(headers) -> str:
     """Extract the rel="next" URL from an HTTP Link header (Okta pagination).
