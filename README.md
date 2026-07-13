@@ -12,10 +12,10 @@ It talks to Frontegg **directly** using the credential from `aspect auth` — no
 intermediary service and no Frontegg secret to manage.
 
 > [!IMPORTANT]
-> With `--dry-run=false` this performs **real** writes (invite / deactivate) in
-> your Frontegg account. It defaults to `--dry-run=true`, which only reads Okta
-> and prints the changes it *would* make. Mutating identity from CI should get a
-> security-team review first (Aspect ticket ENG-1746).
+> This **applies changes by default** (invite / deactivate in your Frontegg
+> account) — it's built to run unattended as a daily cron. Pass `--dry-run` to
+> preview the reconciliation without writing. Mutating identity from CI should
+> get a security-team review first.
 
 ## What it does
 
@@ -74,19 +74,19 @@ Add the extension to your `MODULE.aspect` (see [`example/`](./example)):
 axl_local_dep(name = "import_users", path = "path/to/import-users", auto_use_tasks = True)
 ```
 
-Dry run (default — safe, read-only):
+Preview (read-only — pass `--dry-run`):
 
 ```sh
 aspect auth login              # as an Account Admin of the target account
 export OKTA_ORG=acme
 export OKTA_API_TOKEN=…
-aspect import-okta-users       # defaults to --role viewer, --dry-run=true
+aspect import-okta-users --dry-run
 ```
 
-Apply for real:
+Apply (the default):
 
 ```sh
-aspect import-okta-users --frontegg-url=https://auth.aspect.build --dry-run=false
+aspect import-okta-users --frontegg-url=https://auth.aspect.build
 ```
 
 Flags:
@@ -95,7 +95,7 @@ Flags:
 | --------------------- | ----------- | ------------------------------------------------ |
 | `--okta-org`          | `$OKTA_ORG` | Okta org subdomain, hostname, or full URL.       |
 | `--role`              | `viewer`    | Role on upsert: `viewer` or `admin`.             |
-| `--dry-run`           | `true`      | Print planned changes without applying them.     |
+| `--dry-run`           | `false`     | Preview the reconciliation without writing.      |
 | `--frontegg-url`      | `$FRONTEGG_URL` | Aspect/Frontegg host. Required for writes.   |
 | `--send-invite-email` | `false`     | Send Frontegg's invite email (off by default).   |
 | `--profile`           | `default`   | Aspect credential profile to use.                |
@@ -135,7 +135,7 @@ jobs:
           OKTA_ORG: ${{ vars.OKTA_ORG }}
           OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
           FRONTEGG_URL: ${{ vars.FRONTEGG_URL }}
-        run: aspect import-okta-users --dry-run=false
+        run: aspect import-okta-users # applies by default
 ```
 
 ## Validating locally
@@ -150,8 +150,9 @@ python3 test/mock_okta.py &
 # 2. Authenticate to Aspect (the tool refuses to run otherwise).
 aspect auth login
 
-# 3. Point the tool at the mock. OKTA_API_TOKEN can be any non-empty value.
-OKTA_API_TOKEN=dummy aspect import-okta-users --okta-org=http://localhost:8799
+# 3. Point the tool at the mock. --dry-run previews without writing;
+#    OKTA_API_TOKEN can be any non-empty value.
+OKTA_API_TOKEN=dummy aspect import-okta-users --okta-org=http://localhost:8799 --dry-run
 ```
 
 Expected dry-run output:
@@ -163,8 +164,8 @@ Planned reconciliation for account <your-tenant> (role=viewer):
   - deactivate old@acme.com <old@acme.com> [DEPROVISIONED]
 ```
 
-For a real run, use `--okta-org=<your-org>`, a real `OKTA_API_TOKEN`,
-`--frontegg-url=<your-host>`, and `--dry-run=false`.
+For a real run, drop `--dry-run` and use `--okta-org=<your-org>`, a real
+`OKTA_API_TOKEN`, and `--frontegg-url=<your-host>`.
 
 ### Targeting a non-production Aspect environment
 
@@ -176,7 +177,7 @@ distinct `--profile` to keep it beside your prod login:
 ```sh
 __ASPECT_ENVIRONMENT__=staging aspect auth login --profile staging
 __ASPECT_ENVIRONMENT__=staging OKTA_API_TOKEN=dummy \
-  aspect import-okta-users --okta-org=http://localhost:8799 --profile staging
+  aspect import-okta-users --okta-org=http://localhost:8799 --profile staging --dry-run
 ```
 
 ## Status
@@ -184,4 +185,4 @@ __ASPECT_ENVIRONMENT__=staging OKTA_API_TOKEN=dummy \
 Read + pagination + dry-run diff, `aspect auth`-derived account scoping, and the
 write path (invite with role + deactivate, direct to Frontegg) are implemented
 and validated against a live Okta trial + Frontegg account. Mutating identity
-from CI should still get a security-team +1 (ENG-1746).
+from CI should still get a security-team +1.
